@@ -41,6 +41,7 @@ const (
 
 	fileUpload uploadType = iota
 	functionUpload
+	edgeFunctionUpload
 
 	lfsVersionString = "version https://git-lfs.github.com/spec/v1"
 
@@ -105,6 +106,7 @@ type DeployOptions struct {
 
 	files             *deployFiles
 	functions         *deployFiles
+	edgeFunctions     *deployFiles
 	functionSchedules []*models.FunctionSchedule
 	functionsConfig   map[string]models.FunctionConfig
 }
@@ -320,6 +322,15 @@ func (n *Netlify) DoDeploy(ctx context.Context, options *DeployOptions, deploy *
 	options.functionSchedules = schedules
 	options.functionsConfig = functionsConfig
 
+	edgeFunctions, err := bundleEdgeFunctions(ctx, options.EdgeFunctionsDir, options.Observer)
+	if err != nil {
+		if options.Observer != nil {
+			options.Observer.OnFailedWalk()
+		}
+		return nil, err
+	}
+	options.edgeFunctions = edgeFunctions
+
 	deployFiles := &models.DeployFiles{
 		Files:            options.files.Sums,
 		Draft:            options.IsDraft,
@@ -329,6 +340,9 @@ func (n *Netlify) DoDeploy(ctx context.Context, options *DeployOptions, deploy *
 	}
 	if options.functions != nil {
 		deployFiles.Functions = options.functions.Sums
+	}
+	if options.edgeFunctions != nil {
+		deployFiles.EdgeFunctions = options.edgeFunctions.Sums
 	}
 
 	if len(options.Environment) > 0 {
@@ -411,7 +425,7 @@ func (n *Netlify) DoDeploy(ctx context.Context, options *DeployOptions, deploy *
 		}
 	}
 
-	if len(deploy.Required) == 0 && len(deploy.RequiredFunctions) == 0 {
+	if len(deploy.Required) == 0 && len(deploy.RequiredFunctions) == 0 && len(deploy.RequiredEdgeFunctions) == 0 {
 		return deploy, nil
 	}
 
@@ -423,6 +437,12 @@ func (n *Netlify) DoDeploy(ctx context.Context, options *DeployOptions, deploy *
 
 	if options.functions != nil {
 		if err := n.uploadFiles(ctx, deploy, options.functions, options.Observer, functionUpload, options.UploadTimeout, skipRetry); err != nil {
+			return nil, err
+		}
+	}
+
+	if options.edgeFunctions != nil {
+		if err := n.uploadFiles(ctx, deploy, options.edgeFunctions, options.Observer, edgeFunctionUpload, options.UploadTimeout, skipRetry); err != nil {
 			return nil, err
 		}
 	}
@@ -490,6 +510,8 @@ func (n *Netlify) uploadFiles(ctx context.Context, d *models.Deploy, files *depl
 		required = d.Required
 	case functionUpload:
 		required = d.RequiredFunctions
+	case edgeFunctionUpload:
+		required = d.RequiredEdgeFunctions
 	}
 
 	count := 0
@@ -617,6 +639,20 @@ func (n *Netlify) uploadFile(ctx context.Context, d *models.Deploy, f *FileBundl
 					params.SetRequestTimeout(timeout)
 				}
 				_, operationError = n.Operations.UploadDeployFunction(params, authInfo)
+			}
+		case edgeFunctionUpload:
+			var body io.ReadCloser
+			body, operationError = os.Open(f.Path)
+			if operationError == nil {
+				defer body.Close()
+				params := operations.NewUploadDeployEdgeFunctionParams().WithDeployID(d.ID).WithCodeSha(f.Sum).WithFileBody(body)
+				if retryCount > 0 {
+					params = params.WithXNfRetryCount(&retryCount)
+				}
+				if timeout != 0 {
+					params.SetTimeout(timeout)
+				}
+				_, operationError = n.Operations.UploadDeployEdgeFunction(params, authInfo)
 			}
 		}
 
@@ -1075,6 +1111,67 @@ func zipFunctionFile(filePath string, i os.FileInfo, runtime string, tmpDir *laz
 		Sum:  hex.EncodeToString(s.Sum(nil)),
 		Path: tmpName,
 	}, nil
+}
+
+// bundleEdgeFunctions reads the edge-bundler manifest from edgeFunctionsDir and turns each bundle it
+// lists into an uploadable FileBundle. The deploy declares these as its edge_functions map
+// ({format => code_sha}); the server replies with the subset (required_edge_functions) not already
+// stored, and only those are streamed up. A missing manifest means no edge functions to upload.
+func bundleEdgeFunctions(ctx context.Context, edgeFunctionsDir string, observer DeployObserver) (*deployFiles, error) {
+	if edgeFunctionsDir == "" {
+		return nil, nil
+	}
+
+	manifestBytes, err := os.ReadFile(filepath.Join(edgeFunctionsDir, "manifest.json"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	context.GetLogger(ctx).Debug("Found edge functions manifest file")
+
+	var manifest edgeFunctionsManifest
+	if err := json.Unmarshal(manifestBytes, &manifest); err != nil {
+		return nil, fmt.Errorf("malformed edge functions manifest file: %w", err)
+	}
+
+	if len(manifest.Bundles) == 0 {
+		return nil, nil
+	}
+
+	files := newDeployFiles()
+	for _, bundle := range manifest.Bundles {
+		file, err := newEdgeFunctionFile(edgeFunctionsDir, bundle)
+		if err != nil {
+			return nil, err
+		}
+		files.Add(file.Name, file)
+
+		if observer != nil {
+			if err := observer.OnSuccessfulStep(file); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return files, nil
+}
+
+func newEdgeFunctionFile(edgeFunctionsDir string, bundle edgeFunctionsManifestBundle) (*FileBundle, error) {
+	path := filepath.Join(edgeFunctionsDir, bundle.Asset)
+
+	// code_sha is the dedup key in the deployer<->functions-origin contract, so we compute it from the
+	// bundle's bytes rather than trusting the edge-bundler's asset filename (which currently also happens
+	// to be the sha256, but that's a bundler implementation detail). createFileBundleWithHasher streams
+	// the bytes through the hasher, so the bundle is never held in memory.
+	file, err := createFileBundleWithHasher(bundle.Format, path, sha256.New())
+	if err != nil {
+		return nil, fmt.Errorf("edge functions manifest specifies a bundle that cannot be read: %s: %w", bundle.Asset, err)
+	}
+
+	return file, nil
 }
 
 func zipFile(i os.FileInfo) bool {

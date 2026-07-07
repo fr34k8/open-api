@@ -3,6 +3,8 @@ package porcelain
 import (
 	"bytes"
 	gocontext "context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -781,6 +783,88 @@ func TestUploadFunctions_RetryCountHeader(t *testing.T) {
 	}
 
 	require.NoError(t, client.uploadFiles(apiCtx, d, files, nil, functionUpload, time.Minute, false))
+}
+
+func TestBundleEdgeFunctions(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "aaa111.eszip"), []byte("eszip-bundle"), 0644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "bbb222.tar.gz"), []byte("tar-bundle"), 0644))
+	// A realistic edge-bundler manifest: an eszip plus a tar bundle (asset names are "<sha256><ext>",
+	// e.g. ".eszip" / ".tar.gz"). porcelain declares every bundle regardless of format; restricting to a
+	// format (today, tar) is bitballoon's job, not the client's.
+	manifest := `{
+		"bundles": [
+			{ "asset": "aaa111.eszip", "format": "eszip2" },
+			{ "asset": "bbb222.tar.gz", "format": "tar" }
+		]
+	}`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0644))
+
+	files, err := bundleEdgeFunctions(gocontext.Background(), dir, mockObserver{})
+	require.NoError(t, err)
+
+	// The declared edge_functions map keys each bundle by its format, with the code_sha computed by the
+	// deployer from the bundle bytes (not parsed from the asset filename).
+	eszipSha := sha256.Sum256([]byte("eszip-bundle"))
+	tarSha := sha256.Sum256([]byte("tar-bundle"))
+	require.Equal(t, map[string]string{
+		"eszip2": hex.EncodeToString(eszipSha[:]),
+		"tar":    hex.EncodeToString(tarSha[:]),
+	}, files.Sums)
+
+	// Bundles are tracked by Path and streamed at upload time; they are never buffered into memory.
+	require.Equal(t, filepath.Join(dir, "bbb222.tar.gz"), files.Files["tar"].Path)
+	require.Nil(t, files.Files["tar"].Buffer)
+}
+
+func TestBundleEdgeFunctions_NoManifest(t *testing.T) {
+	// No edge functions dir configured.
+	files, err := bundleEdgeFunctions(gocontext.Background(), "", mockObserver{})
+	require.NoError(t, err)
+	require.Nil(t, files)
+
+	// A dir without a manifest.json yields no edge functions rather than an error.
+	files, err = bundleEdgeFunctions(gocontext.Background(), t.TempDir(), mockObserver{})
+	require.NoError(t, err)
+	require.Nil(t, files)
+}
+
+func TestUploadEdgeFunctions(t *testing.T) {
+	ctx, cancel := gocontext.WithCancel(gocontext.Background())
+	t.Cleanup(cancel)
+
+	bundleBody := []byte("baked-tar-bundle-bytes")
+
+	var gotPath string
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		gotPath = req.URL.Path
+		gotBody, _ = io.ReadAll(req.Body)
+		rw.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	hu, _ := url.Parse(server.URL)
+	tr := apiClient.NewWithClient(hu.Host, "/api/v1", []string{"http"}, http.DefaultClient)
+	client := NewRetryable(tr, strfmt.Default, 1)
+	client.uploadLimit = 1
+	apiCtx := context.WithAuthInfo(ctx, apiClient.BearerToken("token"))
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "edgecodesha.tar.gz"), bundleBody, 0644))
+	manifest := `{ "bundles": [ { "asset": "edgecodesha.tar.gz", "format": "tar" } ] }`
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "manifest.json"), []byte(manifest), 0644))
+
+	files, err := bundleEdgeFunctions(gocontext.Background(), dir, mockObserver{})
+	require.NoError(t, err)
+
+	codeSha := files.Sums["tar"]
+	d := &models.Deploy{ID: "deploy-id", RequiredEdgeFunctions: []string{codeSha}}
+
+	require.NoError(t, client.uploadFiles(apiCtx, d, files, nil, edgeFunctionUpload, time.Minute, false))
+
+	require.Equal(t, "/api/v1/deploys/deploy-id/edge_functions/"+codeSha, gotPath)
+	require.Equal(t, bundleBody, gotBody)
 }
 
 func TestBundle(t *testing.T) {
